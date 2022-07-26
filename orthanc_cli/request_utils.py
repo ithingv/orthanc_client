@@ -1,0 +1,256 @@
+import logging
+import os
+from threading import Lock
+import urllib.parse as urlparse
+import xml.etree.ElementTree as ElementTree
+import requests
+
+from . import utils
+
+PAGE_SIZE = 5000
+
+DCM_EXT = ".dcm"
+JPG_EXT = ".jpg"
+PNG_ENT = ".png"
+RAW_EXT = ".raw"
+
+CONTENT_TYPE = "Content-Type"
+MULTIPART = "multipart/related"
+TRANSFER_SYNTAX = "transfer-syntax="
+
+
+def filter_urllib3_logging():
+    """Filter header errors from urllib3 due to a urllib3 bug"""
+    urllib3_logger = logging.getLogger("urllib3.connectionpool")
+    if not any(isinstance(x, NoHeaderErrorFilter) for x in urllib3_logger.filters):
+        urllib3_logger.addFilter(NoHeaderErrorFilter())
+
+
+class NoHeaderErrorFilter(logging.Filter):
+    """Filter out urllib3 Header Parsing Errors due to a urllib3 bug."""
+
+    def filter(self, record):
+        """Filter out Header Parsing Errors."""
+        return "Failed to parse headers" not in record.getMessage()
+
+
+filter_urllib3_logging()
+
+
+def add_limit_if_not_present(parameters, limit=PAGE_SIZE):
+    """Adds limit parameter if it's not present"""
+    if "limit" not in parameters:
+        if len(parameters) > 0:
+            parameters += "&"
+        parameters += "limit={}".format(limit)
+    return parameters
+
+
+def extension_by_headers(content_type):
+    """Generates extension string and multipart flag"""
+    if "dicom" in content_type:
+        return DCM_EXT
+    if "jpeg" in content_type:
+        return JPG_EXT
+    if "png" in content_type:
+        return PNG_ENT
+    if "application/octet-stream" in content_type:
+        return RAW_EXT
+
+    
+    raise ValueError("unknown extension {}".format(content_type))
+
+
+def parse_boundary(content_type):
+    """Returns boundary from content type"""
+    boundary_start = content_type.find("boundary=")+9
+    return bytes(content_type[boundary_start:content_type.find(
+        ";", boundary_start)], "utf-8")
+
+
+def adjust_mime_type(mime_type):
+    """Adjusts mime type to format
+    "multipart/related; type=<type>[; transfer-syntax=<transfer-syntax>]"
+    """
+    if not mime_type:
+        return "application/dicom; " + TRANSFER_SYNTAX+"*"
+    transfer_syntax = ""
+    if TRANSFER_SYNTAX in mime_type:
+        mime_type_splitted = mime_type.split("; ")
+        if len(mime_type_splitted) != 2:
+            raise ValueError("incorrect type value {}".format(mime_type))
+        mime_type = mime_type_splitted[0]
+        transfer_syntax = TRANSFER_SYNTAX+'{}'.format(
+            mime_type_splitted[1][16:]
+        )
+    
+    return MULTIPART + '; type="{}"; '.format(mime_type) + transfer_syntax
+
+
+def build_multipart_file_name(file_name, frame_index, extension):
+    """Builds file name for different extensions and frames"""
+    if extension != DCM_EXT:
+        filename += "_frame_" + str(frame_index)
+    return file_name + extension
+
+
+class NetworkError(Exception):
+    """exception for unexpected responses"""
+
+
+class Requests:
+    """Class keep state of credentials and performs request to dcomweb"""
+
+    def __init__(self, host_str, authenticator):
+        self.host = utils.validate_host_str(host_str)
+        self.autenticator = authenticator
+        self.autenticator_lock = Lock()
+
+
+    def apply_credentials(self, headers):
+        """Apply credentials from authenticator to headers"""
+        if self.authenticator:
+            with self.authenticator_lock:
+                self.authenticator.apply_credentials(headers)
+        return headers
+
+
+    def request(self, path, parameters, headers, stream=False):
+        """Performs request to dicomweb"""
+        url = self.build_url(path=path, parameters=parameters)
+        logging.debug('requesting %s', url)
+        response = requests.get(url, headers=self.apply_credentials(headers), stream=stream)
+        status_code = response.status_code
+        if not (200 <= status_code < 300):
+            raise NetworkError("Unexpected return code {}\n {}".format(
+                response.status_code, utils.pretty_format(
+                    response.text, response.headers[CONTENT_TYPE])))
+
+        return response
+
+
+    def upload_dicom(self, filename):
+        """Uploads single file to dicomeweb
+            :param filename: path to dicom file in filesystem
+            :returns: amount of bytes tranferred during upload"
+        """
+        with open(filename, 'rb') as file:
+            headers = self.apply_credentials(
+                {CONTENT_TYPE: 'application/dicom'})
+            response = requests.post(self.build_url(
+                "studies", ""), headers=headers, data=file)
+            if response.status_code != 200:
+                raise NetworkError("uploading file: {}\n response: {}".format(
+                    filename, utils.pretty_format(
+                        response.text, response.headers[CONTENT_TYPE])))
+            retrieve_url = ElementTree.fromstring(response.text).find(
+                "*[@keyword='ReferencedSOPSequence']//*[@keyword='RetrieveURL']*").text
+            return {"transferred": file.tell(), "message": "{} uploaded as {}"\
+            .format(filename, retrieve_url)}
+                
+
+    def delete_dicom(self, path):
+        """Deletes single dicom object by sending DELETE http request"""
+        path = utils.validate_path(path)
+        response = requests.delete(self.build_url(
+            path, ""), headers=self.apply_credentials({}))
+        if response.status_code != 200:
+            raise NetworkError("sending http delete request: {}\n response: {}".format(
+                path, utils.pretty_format(response.text, response.headers[CONTENT_TYPE])
+            ))
+        return response.text
+
+
+    def search_instances_by_page(self, ids, parameters, page):
+        """Performs page request"""
+        LIMIT = PAGE_SIZE
+        par = urlparse.parse_qs(parameters)
+        if "offset" in par:
+            raise ValueError("offset shouln't be specified")
+        if "limit" in par:
+            limit = int(par["limit"][0])
+        if limit > PAGE_SIZE:
+            raise ValueError("limit can't be more than {}".format(PAGE_SIZE))
+        text = "[]"
+        response = self.request(
+            utils.path_from_ids(
+                ids)+"/instances", add_limit_if_not_present(parameters, limit)
+            + "&offset={}".format(limit*page), {})
+        if response.status_code == 200:
+            text = response.text
+        return text
+
+
+    def download_dicom(self, url, folder, filename, mime_type):
+        """Download dicom object or frames from this dicom object according to mime_type
+        :param url: url to dicom object
+        :param folder: folder in local file system to store files,
+                        would be created if not exist
+        :param filename: base for filename, extension and frame number added based on respone headers
+        :param mime_type: mime_type to request (image/png, image/jpeg)
+        """
+        mime_type = adjust_mime_type(mime_type)
+        
+        os.makedirs(folder, exist_ok=True)
+
+        response = self.request(url, "", {'Accept' : mime_type}, stream=True)
+        content_type = response.headers[CONTENT_TYPE].lower()
+        extension = extension_by_headers(content_type)
+        is_multipart = content_type.startswith(MULTIPART)
+        filename = folder + filename
+        boundary = None
+        if is_multipart:
+            frame_index = 0
+            file = None
+            boundary = parse_boundary(content_type=)
+        else:
+            file = open(filename+extension, 'wb')
+        transferred = 0
+        for chunk, new_file in MultipartChunksReader(
+            response.iter_content(chunk_size=8192), boundary).read_chunks():
+            if new_file:
+                if file:
+                    file.close()
+                frame_index += 1
+                file = open(build_multipart_file_name(
+                    filename, frame_index, extension), 'wb')
+            transferred += file.write(chunk)
+        if not file.closed:
+            file.close()
+        return {"tranferred" : transferred}
+
+
+    def download_dicom_by_ids(self, ids, output="./", mime_type=None):
+        """Downloads instance based on ids dict object"""
+        url = utils.path_from_ids(ids)
+        folder, filename = utils.file_system_full_path_by_ids(ids, output)
+        return self.download_dicom(url, folder, filename, mime_type)
+
+
+    def build_url(self, path, parameters):
+        path_str = str(path)
+        if len(path_str) > 0 and path_str[0] == utils.SPLIT_CHAR:
+            path_str = path_str[1:]
+        if parameters and parameters[0] != '?':
+            path_str += "?"
+        return self.host + path_str + parameters
+
+    
+class MultipartChunksReader:
+    """Class keep state of multipart stream"""
+
+    def __init__(self, chunks, boundary):
+        self.chunks = chunks
+        self.boundary = boundary
+
+
+    def read_chunks(self):
+        """Streaming flag of new file and chunks and except boundary chunks"""
+        new_file = False
+        for chunk in self.chunks:
+            if self.boundary and self.boundary in chunk:
+                if bytes(CONTENT_TYPE, 'utf-8') in chunk:
+                    new_file = True
+            else:
+                yield chunk, new_file
+                new_file = False
